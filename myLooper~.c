@@ -10,7 +10,8 @@ typedef enum {
     STATE_PLAYING = 2,
     STATE_OVERDUBBING = 3,
     STATE_PAUSED = 4,
-    STATE_WAITING_SYNC = 5
+    STATE_WAITING_SYNC = 5,
+    STATE_PLAYING_ONCE = 6
 } t_loop_state;
 
 static t_class *mylooper_tilde_class = NULL;
@@ -44,16 +45,19 @@ typedef struct _mylooper_tilde
     t_float elapsed_time; // elapsed time in seconds
     
     // Outlets
-    t_outlet *x_out_signal;  // signal outlet
-    t_outlet *x_out_state;   // state outlet (0-5)
-    t_outlet *x_out_sync;    // sync outlet for master mode
+    t_outlet *x_out_signal;    // signal outlet
+    t_outlet *x_out_state;     // state outlet (0-5)
+    t_outlet *x_out_sync;      // sync outlet for master mode
+    t_outlet *x_out_duration;  // duration outlet (loop length in ms)
     
 } t_mylooper_tilde;
 
 // Forward declarations
 static void mylooper_tilde_clear(t_mylooper_tilde *x);
 static void mylooper_tilde_record(t_mylooper_tilde *x);
+static void mylooper_tilde_stop_recording(t_mylooper_tilde *x);
 static void mylooper_tilde_play(t_mylooper_tilde *x);
+static void mylooper_tilde_play_once(t_mylooper_tilde *x);
 static void mylooper_tilde_stop(t_mylooper_tilde *x);
 static void mylooper_tilde_overdub(t_mylooper_tilde *x);
 static void mylooper_tilde_pause(t_mylooper_tilde *x);
@@ -62,6 +66,17 @@ static void mylooper_tilde_pause(t_mylooper_tilde *x);
 static void update_state(t_mylooper_tilde *x, t_loop_state new_state) {
     x->state = new_state;
     outlet_float(x->x_out_state, (t_float)new_state);
+}
+
+// Calculate and output loop duration in milliseconds
+static void output_loop_duration(t_mylooper_tilde *x) {
+    if (x->loop_length > 0 && x->sample_rate > 0) {
+        t_float duration_ms = (t_float)x->loop_length / x->sample_rate * 1000.0f;
+        outlet_float(x->x_out_duration, duration_ms);
+        post("mylooper~: loop duration = %.2f ms", duration_ms);
+    } else {
+        outlet_float(x->x_out_duration, 0.0f);
+    }
 }
 
 // Free buffer memory
@@ -157,7 +172,7 @@ static t_int *mylooper_tilde_perform(t_int *w)
                     output = buffer[play_pos++];
                     if (play_pos >= loop_length) {
                         play_pos = 0; // Loop around
-                        
+                        state = STATE_IDLE; // loop is over
                         // Send sync message when loop wraps (only if master)
                         if (x->master && x->sync_enabled) {
                             outlet_bang(x->x_out_sync);
@@ -165,7 +180,41 @@ static t_int *mylooper_tilde_perform(t_int *w)
                         }
                     }
                 } else {
-                    output = input; // No recorded material, pass through
+                    output = 0.0f; // No recorded material, output silence
+                }
+                break;
+                
+            case STATE_PLAYING_ONCE:
+                // Play back buffer once and then stop
+                if (loop_length > 0 && play_pos < loop_length) {
+                    // Play the current sample
+                    output = buffer[play_pos];
+                    
+                    // Increment position AFTER reading the sample
+                    play_pos++;
+                    
+                    // Check if we've reached the end AFTER incrementing
+                    if (play_pos >= loop_length) {
+                        // We've played the entire buffer including the last sample
+                        
+                        // Reset play position before state transition
+                        play_pos = 0;
+                        
+                        // NOW transition to IDLE
+                        state = STATE_IDLE;
+                        
+                        // Send sync message if master
+                        if (x->master && x->sync_enabled) {
+                            // First log, then send bang
+                            post("mylooper~: one-shot playback finished, sending sync");
+                            outlet_bang(x->x_out_sync);
+                            post("mylooper~: sync bang sent (master - play_once finished)");
+                        } else {
+                            post("mylooper~: one-shot playback finished");
+                        }
+                    }
+                } else {
+                    output = 0.0f; // No recorded material or playback done
                 }
                 break;
                 
@@ -218,11 +267,20 @@ static t_int *mylooper_tilde_perform(t_int *w)
         *out++ = output;
     }
     
+    // Remember previous state
+    t_loop_state prev_state = x->state;
+    
     // Update instance state
     x->state = state;
     x->write_pos = write_pos;
     x->play_pos = play_pos;
     x->loop_length = loop_length;
+    
+    // Output duration only when transitioning from RECORDING to another state
+    // This avoids continuous output during recording
+    if (prev_state == STATE_RECORDING && state != STATE_RECORDING && loop_length > 0) {
+        output_loop_duration(x);
+    }
     
     // Update elapsed time (for sync calculations)
     x->elapsed_time += (float)n / x->sample_rate;
@@ -255,6 +313,8 @@ static void mylooper_tilde_clear(t_mylooper_tilde *x)
     x->write_pos = 0;
     x->play_pos = 0;
     update_state(x, STATE_IDLE);
+    // Output zero duration when buffer is cleared
+    output_loop_duration(x);
     post("mylooper~: buffer cleared");
 }
 
@@ -269,12 +329,40 @@ static void mylooper_tilde_record(t_mylooper_tilde *x)
     post("mylooper~: recording started");
 }
 
+// Stop recording without starting playback
+static void mylooper_tilde_stop_recording(t_mylooper_tilde *x)
+{
+    // Only relevant if we're currently recording
+    if (x->state == STATE_RECORDING) {
+        update_state(x, STATE_IDLE);
+        // Output loop duration explicitly when stopping recording
+        if (x->loop_length > 0) {
+            output_loop_duration(x);
+        }
+        post("mylooper~: recording stopped, loop length = %d samples", x->loop_length);
+    }
+}
+
 // Start playback
 static void mylooper_tilde_play(t_mylooper_tilde *x)
 {
     if (x->loop_length > 0) {
+        // Save the current state
+        t_loop_state prev_state = x->state;
+        
+        // If we were recording, explicitly output the duration
+        if (prev_state == STATE_RECORDING) {
+            output_loop_duration(x);
+        }
+        
         x->play_pos = 0;
         update_state(x, STATE_PLAYING);
+        
+        // Output loop duration when starting from a non-recording state
+        if (prev_state != STATE_RECORDING) {
+            output_loop_duration(x);
+        }
+        
         post("mylooper~: playback started");
     } else {
         pd_error(x, "mylooper~: nothing to play (record something first)");
@@ -285,6 +373,8 @@ static void mylooper_tilde_play(t_mylooper_tilde *x)
 static void mylooper_tilde_stop(t_mylooper_tilde *x)
 {
     update_state(x, STATE_IDLE);
+    // Output loop duration when stopping
+    output_loop_duration(x);
     post("mylooper~: stopped");
 }
 
@@ -293,9 +383,53 @@ static void mylooper_tilde_overdub(t_mylooper_tilde *x)
 {
     if (x->loop_length > 0) {
         update_state(x, STATE_OVERDUBBING);
+        // Output loop duration when starting overdub
+        output_loop_duration(x);
         post("mylooper~: overdubbing started");
     } else {
         pd_error(x, "mylooper~: nothing to overdub (record something first)");
+    }
+}
+
+// Play loop once and then stop
+static void mylooper_tilde_play_once(t_mylooper_tilde *x)
+{
+    if (x->loop_length > 0) {
+        // Save the current state
+        t_loop_state prev_state = x->state;
+        
+        // Check if we're already in the PLAYING_ONCE state and possibly finished playing
+        // This helps address race conditions with rapid consecutive calls
+        if (prev_state == STATE_PLAYING_ONCE && x->play_pos >= x->loop_length - 1) {
+            // We're likely at the end of playback
+            // Force reset position and add a log message
+            x->play_pos = 0;
+            
+            // Small log indicating we're processing a rapid consecutive play_once
+            post("mylooper~: rapid consecutive play_once detected, resetting play position");
+        } else {
+            // Normal case, just reset position
+            x->play_pos = 0;
+        }
+        
+        // Update the state unconditionally
+        update_state(x, STATE_PLAYING_ONCE);
+        
+        // If we were recording, explicitly output the duration
+        if (prev_state == STATE_RECORDING) {
+            output_loop_duration(x);
+        }
+        
+        // Output loop duration when starting from a non-recording state
+        if (prev_state != STATE_RECORDING) {
+            output_loop_duration(x);
+        }
+        
+        // Debug info: show previous state, new state, and play_pos after reset
+        post("mylooper~: one-shot playback started - Previous state: %d, Current state: %d, play_pos: %d", 
+            prev_state, x->state, x->play_pos);
+    } else {
+        pd_error(x, "mylooper~: nothing to play (record something first)");
     }
 }
 
@@ -358,14 +492,30 @@ static void mylooper_tilde_bpm(t_mylooper_tilde *x, t_floatarg bpm)
 // Receive sync from another looper or external clock
 static void mylooper_tilde_sync_in(t_mylooper_tilde *x)
 {
-    if (!x->master && x->sync_enabled && x->state == STATE_WAITING_SYNC) {
-        // Transition to appropriate state based on context
-        if (x->loop_length == 0) {
-            update_state(x, STATE_RECORDING);
-            post("mylooper~: sync received, started recording");
-        } else {
-            update_state(x, STATE_PLAYING);
-            post("mylooper~: sync received, started playing");
+    if (!x->master && x->sync_enabled) {
+        if (x->state == STATE_WAITING_SYNC) {
+            // ALWAYS reset play position to beginning on sync
+            x->play_pos = 0;
+            
+            // Transition to appropriate state based on context
+            if (x->loop_length == 0) {
+                update_state(x, STATE_RECORDING);
+                post("mylooper~: sync received, started recording");
+            } else {
+                update_state(x, STATE_PLAYING);
+                post("mylooper~: sync received, started playing from beginning");
+            }
+        } 
+        // For play_once looping - also respond to sync when in idle state
+        else if (x->state == STATE_IDLE && x->loop_length > 0) {
+            // Explicit position reset before we call play_once
+            x->play_pos = 0;
+            
+            // A slight delay before calling play_once can help with race conditions
+            // We'll use a flag approach instead since we don't have reliable sleep in PD
+            
+            mylooper_tilde_play_once(x);
+            post("mylooper~: sync received, restarted one-shot playback");
         }
     }
 }
@@ -417,6 +567,7 @@ static void *mylooper_tilde_new(void)
     x->x_out_signal = outlet_new(&x->x_obj, &s_signal);
     x->x_out_state = outlet_new(&x->x_obj, &s_float);
     x->x_out_sync = outlet_new(&x->x_obj, &s_bang);
+    x->x_out_duration = outlet_new(&x->x_obj, &s_float);
     
     return (void *)x;
 }
@@ -438,8 +589,12 @@ void mylooper_tilde_setup(void)
     // Add control methods
     class_addmethod(mylooper_tilde_class, (t_method)mylooper_tilde_record,
                     gensym("record"), 0);
+    class_addmethod(mylooper_tilde_class, (t_method)mylooper_tilde_stop_recording,
+                    gensym("stop_recording"), 0);
     class_addmethod(mylooper_tilde_class, (t_method)mylooper_tilde_play,
                     gensym("play"), 0);
+    class_addmethod(mylooper_tilde_class, (t_method)mylooper_tilde_play_once,
+                    gensym("play_once"), 0);
     class_addmethod(mylooper_tilde_class, (t_method)mylooper_tilde_stop,
                     gensym("stop"), 0);
     class_addmethod(mylooper_tilde_class, (t_method)mylooper_tilde_overdub,
