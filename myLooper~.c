@@ -33,6 +33,10 @@ typedef struct _mylooper_tilde
     t_float overdub_level;// level for overdubbing (0.0 to 1.0)
     t_float feedback;     // feedback level for overdub (0.0 to 1.0)
     
+    // Request flags (for thread-safe state transitions)
+    int request_play_once;       // Request to start play_once on next DSP cycle
+    int just_finished_playonce;  // Flag to track if we just finished a play_once
+    
     // Sync parameters
     int sync_enabled;     // whether sync is enabled
     t_float bpm;          // beats per minute
@@ -133,6 +137,22 @@ static t_int *mylooper_tilde_perform(t_int *w)
     float overdub_level = x->overdub_level;
     float feedback = x->feedback;
     
+    // CRITICAL: Handle any pending play_once requests at the beginning of the DSP cycle
+    // This ensures clean state transitions synchronized with audio processing
+    if (x->request_play_once) {
+        // Clear the request flag
+        x->request_play_once = 0;
+        
+        // Reset position to beginning
+        play_pos = 0;
+        
+        // Update local state
+        state = STATE_PLAYING_ONCE;
+        
+        // Log the state change in the DSP thread
+        post("mylooper~: play_once starting in DSP thread, position reset to %d", play_pos);
+    }
+    
     // Safety check: if buffer not allocated, pass through and return
     if (!buffer) {
         while (n--) {
@@ -190,6 +210,12 @@ static t_int *mylooper_tilde_perform(t_int *w)
                     // Play the current sample
                     output = buffer[play_pos];
                     
+                    // Check if we're at the beginning of playback
+                    if (play_pos == 0) {
+                        // Log start of playback
+                        post("mylooper~: play_once starting actual audio playback");
+                    }
+                    
                     // Increment position AFTER reading the sample
                     play_pos++;
                     
@@ -200,7 +226,13 @@ static t_int *mylooper_tilde_perform(t_int *w)
                         // Reset play position before state transition
                         play_pos = 0;
                         
-                        // NOW transition to IDLE
+                        // Set our protection flag BEFORE changing state
+                        x->just_finished_playonce = 1;
+                        
+                        // Critical change: log our position to help debug
+                        post("mylooper~: play_once reached end, resetting position to %d", play_pos);
+                        
+                        // NOW transition to IDLE - but only if we're not in forced play mode
                         state = STATE_IDLE;
                         
                         // Send sync message if master
@@ -212,6 +244,8 @@ static t_int *mylooper_tilde_perform(t_int *w)
                         } else {
                             post("mylooper~: one-shot playback finished");
                         }
+                        
+                        // The flag will be reset in the next DSP cycle to ensure stable timing
                     }
                 } else {
                     output = 0.0f; // No recorded material or playback done
@@ -288,6 +322,12 @@ static t_int *mylooper_tilde_perform(t_int *w)
     // Update sync phase if sync is enabled
     if (x->sync_enabled && loop_length > 0) {
         x->sync_phase = (float)play_pos / (float)loop_length;
+    }
+    
+    // Reset the protection flag if we're not going directly into another play_once
+    if (x->just_finished_playonce && !x->request_play_once) {
+        x->just_finished_playonce = 0;
+        post("mylooper~: cleared protection flag, ready for next play_once");
     }
     
     return (w + 5);
@@ -395,39 +435,16 @@ static void mylooper_tilde_overdub(t_mylooper_tilde *x)
 static void mylooper_tilde_play_once(t_mylooper_tilde *x)
 {
     if (x->loop_length > 0) {
-        // Save the current state
-        t_loop_state prev_state = x->state;
+        // CRITICAL CHANGE: Instead of changing state directly,
+        // we set a flag for the DSP thread to handle on next cycle
+        x->request_play_once = 1;
         
-        // Check if we're already in the PLAYING_ONCE state and possibly finished playing
-        // This helps address race conditions with rapid consecutive calls
-        if (prev_state == STATE_PLAYING_ONCE && x->play_pos >= x->loop_length - 1) {
-            // We're likely at the end of playback
-            // Force reset position and add a log message
-            x->play_pos = 0;
-            
-            // Small log indicating we're processing a rapid consecutive play_once
-            post("mylooper~: rapid consecutive play_once detected, resetting play position");
-        } else {
-            // Normal case, just reset position
-            x->play_pos = 0;
-        }
+        // Reset position for the upcoming play_once
+        x->play_pos = 0;
         
-        // Update the state unconditionally
-        update_state(x, STATE_PLAYING_ONCE);
-        
-        // If we were recording, explicitly output the duration
-        if (prev_state == STATE_RECORDING) {
-            output_loop_duration(x);
-        }
-        
-        // Output loop duration when starting from a non-recording state
-        if (prev_state != STATE_RECORDING) {
-            output_loop_duration(x);
-        }
-        
-        // Debug info: show previous state, new state, and play_pos after reset
-        post("mylooper~: one-shot playback started - Previous state: %d, Current state: %d, play_pos: %d", 
-            prev_state, x->state, x->play_pos);
+        // Log that we've requested a play_once
+        post("mylooper~: play_once requested - Previous state: %d, will start on next DSP cycle", 
+            (int)x->state);
     } else {
         pd_error(x, "mylooper~: nothing to play (record something first)");
     }
@@ -508,14 +525,16 @@ static void mylooper_tilde_sync_in(t_mylooper_tilde *x)
         } 
         // For play_once looping - also respond to sync when in idle state
         else if (x->state == STATE_IDLE && x->loop_length > 0) {
-            // Explicit position reset before we call play_once
+            // Same approach as play_once - use the request flag instead of directly changing state
+            x->request_play_once = 1;
+            
+            // Reset position for the upcoming play_once
             x->play_pos = 0;
             
-            // A slight delay before calling play_once can help with race conditions
-            // We'll use a flag approach instead since we don't have reliable sleep in PD
+            // Clear the protection flag
+            x->just_finished_playonce = 0;
             
-            mylooper_tilde_play_once(x);
-            post("mylooper~: sync received, restarted one-shot playback");
+            post("mylooper~: sync received, play_once scheduled for next DSP cycle");
         }
     }
 }
@@ -556,6 +575,10 @@ static void *mylooper_tilde_new(void)
     x->sample_rate = 44100.0f;
     x->elapsed_time = 0.0f;
     x->sync_phase = 0.0f;
+    
+    // Initialize request flags
+    x->request_play_once = 0;
+    x->just_finished_playonce = 0;
     
     // Allocate initial buffer (will be reallocated when sample rate is known)
     allocate_buffer(x, 0);
