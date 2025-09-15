@@ -14,6 +14,20 @@ typedef enum {
     STATE_PLAYING_ONCE = 6
 } t_loop_state;
 
+// Request type enumeration for thread-safe state transitions
+typedef enum {
+    REQUEST_NONE = 0,
+    REQUEST_RECORD = 1,
+    REQUEST_STOP_RECORDING = 2, 
+    REQUEST_PLAY = 3,
+    REQUEST_PLAY_ONCE = 4,
+    REQUEST_STOP = 5,
+    REQUEST_OVERDUB = 6,
+    REQUEST_PAUSE = 7,
+    REQUEST_CLEAR = 8,
+    REQUEST_WAIT_SYNC = 9
+} t_loop_request;
+
 static t_class *mylooper_tilde_class = NULL;
 
 typedef struct _mylooper_tilde
@@ -34,8 +48,9 @@ typedef struct _mylooper_tilde
     t_float feedback;     // feedback level for overdub (0.0 to 1.0)
     
     // Request flags (for thread-safe state transitions)
-    int request_play_once;       // Request to start play_once on next DSP cycle
-    int just_finished_playonce;  // Flag to track if we just finished a play_once
+    t_loop_request pending_request;  // Pending state change request
+    int play_pos_reset;              // Flag to reset play position on next cycle
+    int just_finished_playonce;      // Flag to track if we just finished a play_once
     
     // Sync parameters
     int sync_enabled;     // whether sync is enabled
@@ -137,20 +152,147 @@ static t_int *mylooper_tilde_perform(t_int *w)
     float overdub_level = x->overdub_level;
     float feedback = x->feedback;
     
-    // CRITICAL: Handle any pending play_once requests at the beginning of the DSP cycle
+    // CRITICAL: Handle any pending requests at the beginning of the DSP cycle
     // This ensures clean state transitions synchronized with audio processing
-    if (x->request_play_once) {
-        // Clear the request flag
-        x->request_play_once = 0;
+    if (x->pending_request != REQUEST_NONE) {
+        switch (x->pending_request) {
+            case REQUEST_NONE:
+                // Nothing to do
+                break;
+                
+            case REQUEST_RECORD:
+                // Clear buffer first
+                if (buffer) {
+                    memset(buffer, 0, buffer_size * sizeof(t_sample));
+                }
+                loop_length = 0;
+                write_pos = 0;
+                play_pos = 0;
+                state = STATE_RECORDING;
+                post("mylooper~: recording started in DSP thread");
+                break;
+                
+            case REQUEST_STOP_RECORDING:
+                // Make sure loop length is a multiple of the buffer size (n)
+                if (loop_length > 0) {
+                    int remainder = loop_length % n;
+                    if (remainder > 0) {
+                        // Round up to the next multiple of n
+                        int additional = n - remainder;
+                        if ((loop_length + additional) <= buffer_size) {
+                            // Zero out the additional samples
+                            for (int i = loop_length; i < loop_length + additional; i++) {
+                                buffer[i] = 0.0f;
+                            }
+                            loop_length += additional;
+                            post("mylooper~: adjusted loop length to %d samples to ensure it's a multiple of buffer size %d", loop_length, n);
+                        }
+                    }
+                }
+                state = STATE_IDLE;
+                
+                // Output loop duration
+                if (loop_length > 0 && x->sample_rate > 0) {
+                    t_float duration_ms = (t_float)loop_length / x->sample_rate * 1000.0f;
+                    outlet_float(x->x_out_duration, duration_ms);
+                    post("mylooper~: recording stopped in DSP thread, loop length = %d samples (%.2f ms)", loop_length, duration_ms);
+                }
+                break;
+                
+            case REQUEST_PLAY:
+                if (x->play_pos_reset) {
+                    play_pos = 0;
+                    x->play_pos_reset = 0;
+                }
+                state = STATE_PLAYING;
+                
+                // Output loop duration
+                if (loop_length > 0 && x->sample_rate > 0) {
+                    t_float duration_ms = (t_float)loop_length / x->sample_rate * 1000.0f;
+                    outlet_float(x->x_out_duration, duration_ms);
+                    post("mylooper~: playback started in DSP thread, duration = %.2f ms", duration_ms);
+                }
+                break;
+                
+            case REQUEST_PLAY_ONCE:
+                play_pos = 0;
+                state = STATE_PLAYING_ONCE;
+                post("mylooper~: play_once starting in DSP thread, position reset to %d", play_pos);
+                break;
+                
+            case REQUEST_STOP:
+                state = STATE_IDLE;
+                
+                // Output loop duration
+                if (loop_length > 0 && x->sample_rate > 0) {
+                    t_float duration_ms = (t_float)loop_length / x->sample_rate * 1000.0f;
+                    outlet_float(x->x_out_duration, duration_ms);
+                    post("mylooper~: stopped in DSP thread");
+                }
+                break;
+                
+            case REQUEST_OVERDUB:
+                // Si nous venons du mode enregistrement, nous devons d'abord finaliser la longueur de boucle
+                if (x->state == STATE_RECORDING) {
+                    // Make sure loop length is a multiple of the buffer size (n)
+                    if (loop_length > 0) {
+                        int remainder = loop_length % n;
+                        if (remainder > 0) {
+                            // Round up to the next multiple of n
+                            int additional = n - remainder;
+                            if ((loop_length + additional) <= buffer_size) {
+                                // Zero out the additional samples
+                                for (int i = loop_length; i < loop_length + additional; i++) {
+                                    buffer[i] = 0.0f;
+                                }
+                                loop_length += additional;
+                                post("mylooper~: adjusted loop length to %d samples to ensure it's a multiple of buffer size %d", loop_length, n);
+                            }
+                        }
+                    }
+                    post("mylooper~: switching from recording to overdubbing in DSP thread");
+                }
+                
+                state = STATE_OVERDUBBING;
+                
+                // Output loop duration
+                if (loop_length > 0 && x->sample_rate > 0) {
+                    t_float duration_ms = (t_float)loop_length / x->sample_rate * 1000.0f;
+                    outlet_float(x->x_out_duration, duration_ms);
+                    post("mylooper~: overdubbing started in DSP thread");
+                }
+                break;
+                
+            case REQUEST_PAUSE:
+                state = STATE_PAUSED;
+                post("mylooper~: paused in DSP thread");
+                break;
+                
+            case REQUEST_CLEAR:
+                if (buffer) {
+                    memset(buffer, 0, buffer_size * sizeof(t_sample));
+                }
+                loop_length = 0;
+                write_pos = 0;
+                play_pos = 0;
+                state = STATE_IDLE;
+                
+                // Output zero duration
+                outlet_float(x->x_out_duration, 0.0f);
+                post("mylooper~: buffer cleared in DSP thread");
+                break;
+                
+            case REQUEST_WAIT_SYNC:
+                state = STATE_WAITING_SYNC;
+                post("mylooper~: waiting for sync in DSP thread");
+                break;
+        }
         
-        // Reset position to beginning
-        play_pos = 0;
+        // Clear the request after processing
+        x->pending_request = REQUEST_NONE;
         
-        // Update local state
-        state = STATE_PLAYING_ONCE;
-        
-        // Log the state change in the DSP thread
-        post("mylooper~: play_once starting in DSP thread, position reset to %d", play_pos);
+        // Output state change immediately
+        outlet_float(x->x_out_state, (t_float)state);
     }
     
     // Safety check: if buffer not allocated, pass through and return
@@ -325,7 +467,7 @@ static t_int *mylooper_tilde_perform(t_int *w)
     }
     
     // Reset the protection flag if we're not going directly into another play_once
-    if (x->just_finished_playonce && !x->request_play_once) {
+    if (x->just_finished_playonce && x->pending_request != REQUEST_PLAY_ONCE) {
         x->just_finished_playonce = 0;
         post("mylooper~: cleared protection flag, ready for next play_once");
     }
@@ -346,27 +488,16 @@ static void mylooper_tilde_dsp(t_mylooper_tilde *x, t_signal **sp)
 // Clear the buffer
 static void mylooper_tilde_clear(t_mylooper_tilde *x)
 {
-    if (x->buffer) {
-        memset(x->buffer, 0, x->buffer_size * sizeof(t_sample));
-    }
-    x->loop_length = 0;
-    x->write_pos = 0;
-    x->play_pos = 0;
-    update_state(x, STATE_IDLE);
-    // Output zero duration when buffer is cleared
-    output_loop_duration(x);
-    post("mylooper~: buffer cleared");
+    x->pending_request = REQUEST_CLEAR;
+    post("mylooper~: clear requested, will apply on next DSP cycle");
 }
 
 // Start recording
 static void mylooper_tilde_record(t_mylooper_tilde *x)
 {
-    // Clear buffer first
-    mylooper_tilde_clear(x);
-    
-    // Then start recording
-    update_state(x, STATE_RECORDING);
-    post("mylooper~: recording started");
+    // Instead of changing state directly, set a request flag for the DSP thread
+    x->pending_request = REQUEST_RECORD;
+    post("mylooper~: recording requested, will start on next DSP cycle");
 }
 
 // Stop recording without starting playback
@@ -374,12 +505,8 @@ static void mylooper_tilde_stop_recording(t_mylooper_tilde *x)
 {
     // Only relevant if we're currently recording
     if (x->state == STATE_RECORDING) {
-        update_state(x, STATE_IDLE);
-        // Output loop duration explicitly when stopping recording
-        if (x->loop_length > 0) {
-            output_loop_duration(x);
-        }
-        post("mylooper~: recording stopped, loop length = %d samples", x->loop_length);
+        x->pending_request = REQUEST_STOP_RECORDING;
+        post("mylooper~: stop recording requested, will apply on next DSP cycle");
     }
 }
 
@@ -387,23 +514,9 @@ static void mylooper_tilde_stop_recording(t_mylooper_tilde *x)
 static void mylooper_tilde_play(t_mylooper_tilde *x)
 {
     if (x->loop_length > 0) {
-        // Save the current state
-        t_loop_state prev_state = x->state;
-        
-        // If we were recording, explicitly output the duration
-        if (prev_state == STATE_RECORDING) {
-            output_loop_duration(x);
-        }
-        
-        x->play_pos = 0;
-        update_state(x, STATE_PLAYING);
-        
-        // Output loop duration when starting from a non-recording state
-        if (prev_state != STATE_RECORDING) {
-            output_loop_duration(x);
-        }
-        
-        post("mylooper~: playback started");
+        x->pending_request = REQUEST_PLAY;
+        x->play_pos_reset = 1;  // Request to reset play position
+        post("mylooper~: playback requested, will start on next DSP cycle");
     } else {
         pd_error(x, "mylooper~: nothing to play (record something first)");
     }
@@ -412,20 +525,23 @@ static void mylooper_tilde_play(t_mylooper_tilde *x)
 // Stop any active process and go to idle
 static void mylooper_tilde_stop(t_mylooper_tilde *x)
 {
-    update_state(x, STATE_IDLE);
-    // Output loop duration when stopping
-    output_loop_duration(x);
-    post("mylooper~: stopped");
+    x->pending_request = REQUEST_STOP;
+    post("mylooper~: stop requested, will apply on next DSP cycle");
 }
 
 // Start overdubbing
 static void mylooper_tilde_overdub(t_mylooper_tilde *x)
 {
-    if (x->loop_length > 0) {
-        update_state(x, STATE_OVERDUBBING);
-        // Output loop duration when starting overdub
-        output_loop_duration(x);
-        post("mylooper~: overdubbing started");
+    // Si nous sommes en train d'enregistrer, nous arrêtons l'enregistrement et passons en mode overdub
+    if (x->state == STATE_RECORDING) {
+        // La boucle a déjà du contenu puisqu'on est en train d'enregistrer
+        x->pending_request = REQUEST_OVERDUB;
+        post("mylooper~: recording stopped, overdubbing requested, will start on next DSP cycle");
+    }
+    // Sinon, comportement normal: vérifier qu'une boucle existe
+    else if (x->loop_length > 0) {
+        x->pending_request = REQUEST_OVERDUB;
+        post("mylooper~: overdubbing requested, will start on next DSP cycle");
     } else {
         pd_error(x, "mylooper~: nothing to overdub (record something first)");
     }
@@ -435,12 +551,9 @@ static void mylooper_tilde_overdub(t_mylooper_tilde *x)
 static void mylooper_tilde_play_once(t_mylooper_tilde *x)
 {
     if (x->loop_length > 0) {
-        // CRITICAL CHANGE: Instead of changing state directly,
-        // we set a flag for the DSP thread to handle on next cycle
-        x->request_play_once = 1;
-        
-        // Reset position for the upcoming play_once
-        x->play_pos = 0;
+        // Use the new request system
+        x->pending_request = REQUEST_PLAY_ONCE;
+        x->play_pos_reset = 1;  // Request to reset play position
         
         // Log that we've requested a play_once
         post("mylooper~: play_once requested - Previous state: %d, will start on next DSP cycle", 
@@ -453,8 +566,8 @@ static void mylooper_tilde_play_once(t_mylooper_tilde *x)
 // Pause playback
 static void mylooper_tilde_pause(t_mylooper_tilde *x)
 {
-    update_state(x, STATE_PAUSED);
-    post("mylooper~: paused");
+    x->pending_request = REQUEST_PAUSE;
+    post("mylooper~: pause requested, will apply on next DSP cycle");
 }
 
 // Set overdub level
@@ -525,11 +638,9 @@ static void mylooper_tilde_sync_in(t_mylooper_tilde *x)
         } 
         // For play_once looping - also respond to sync when in idle state
         else if (x->state == STATE_IDLE && x->loop_length > 0) {
-            // Same approach as play_once - use the request flag instead of directly changing state
-            x->request_play_once = 1;
-            
-            // Reset position for the upcoming play_once
-            x->play_pos = 0;
+            // Use the new request system
+            x->pending_request = REQUEST_PLAY_ONCE;
+            x->play_pos_reset = 1;  // Request to reset play position
             
             // Clear the protection flag
             x->just_finished_playonce = 0;
@@ -577,7 +688,8 @@ static void *mylooper_tilde_new(void)
     x->sync_phase = 0.0f;
     
     // Initialize request flags
-    x->request_play_once = 0;
+    x->pending_request = REQUEST_NONE;
+    x->play_pos_reset = 0;
     x->just_finished_playonce = 0;
     
     // Allocate initial buffer (will be reallocated when sample rate is known)
@@ -591,6 +703,10 @@ static void *mylooper_tilde_new(void)
     x->x_out_state = outlet_new(&x->x_obj, &s_float);
     x->x_out_sync = outlet_new(&x->x_obj, &s_bang);
     x->x_out_duration = outlet_new(&x->x_obj, &s_float);
+    
+    // Send initial state and duration (0 ms)
+    outlet_float(x->x_out_state, (t_float)STATE_IDLE);
+    outlet_float(x->x_out_duration, 0.0f);
     
     return (void *)x;
 }
