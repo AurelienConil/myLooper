@@ -148,7 +148,7 @@ static int allocate_buffer(t_mylooper_tilde *x, int size)
         size = (int)(sr * 30.0f);
     }
     x->buffer = (t_sample *)calloc(size, sizeof(t_sample));
-    if (!x->buffer) { pd_error(x, "mylooper~: out of memory"); return 0; }
+    if (!x->buffer) { pd_error(x, "myLooper~: out of memory"); return 0; }
     x->buffer_size = size;
     x->loop_length = x->write_pos = x->play_pos = 0;
     return 1;
@@ -530,7 +530,7 @@ static void mylooper_tilde_end_record(t_mylooper_tilde *x)
 static void mylooper_tilde_play(t_mylooper_tilde *x)
 {
     if (x->state == STATE_RECORDING || x->state == STATE_WAIT_ENDREC) {
-        pd_error(x, "mylooper~: cannot play while recording, call end_record first");
+        pd_error(x, "myLooper~: cannot play while recording, call end_record first");
         return;
     }
     if (x->loop_length > 0) {
@@ -541,7 +541,7 @@ static void mylooper_tilde_play(t_mylooper_tilde *x)
         else
             x->pending_request = x->master ? REQUEST_PLAY : REQUEST_WAIT_PLAY;
     } else {
-        pd_error(x, "mylooper~: nothing to play (record first)");
+        pd_error(x, "myLooper~: nothing to play (record first)");
     }
 }
 
@@ -555,7 +555,7 @@ static void mylooper_tilde_overdub(t_mylooper_tilde *x)
     /* overdub only makes sense on a loop that's actively playing */
     if (x->state != STATE_PLAYING && x->state != STATE_PLAYING_ONCE &&
         x->state != STATE_OVERDUBBING) {
-        pd_error(x, "mylooper~: overdub requires the loop to be playing, call play first");
+        pd_error(x, "myLooper~: overdub requires the loop to be playing, call play first");
         return;
     }
     x->pending_request = REQUEST_OVERDUB;
@@ -564,7 +564,7 @@ static void mylooper_tilde_overdub(t_mylooper_tilde *x)
 static void mylooper_tilde_end_overdub(t_mylooper_tilde *x)
 {
     if (x->state != STATE_OVERDUBBING) {
-        pd_error(x, "mylooper~: not overdubbing");
+        pd_error(x, "myLooper~: not overdubbing");
         return;
     }
     /* already sync'd and running continuously — resume playback immediately,
@@ -593,7 +593,7 @@ static void mylooper_tilde_wait_record(t_mylooper_tilde *x)
 static void mylooper_tilde_wait_play(t_mylooper_tilde *x)
 {
     if (x->state == STATE_RECORDING || x->state == STATE_WAIT_ENDREC) {
-        pd_error(x, "mylooper~: cannot wait_play while recording, call end_record first");
+        pd_error(x, "myLooper~: cannot wait_play while recording, call end_record first");
         return;
     }
     x->pending_request = REQUEST_WAIT_PLAY;
@@ -731,9 +731,9 @@ static void *mylooper_tilde_new(void)
 
 /* ─── Setup ───────────────────────────────────────────────────────────────── */
 
-void mylooper_tilde_setup(void)
+void myLooper_tilde_setup(void)
 {
-    mylooper_tilde_class = class_new(gensym("mylooper~"),
+    mylooper_tilde_class = class_new(gensym("myLooper~"),
                                      (t_newmethod)mylooper_tilde_new,
                                      (t_method)mylooper_tilde_free,
                                      sizeof(t_mylooper_tilde),
