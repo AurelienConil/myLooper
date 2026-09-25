@@ -611,16 +611,30 @@ static void tempo_tick(t_mylooper_tilde *x)
         x->x_notify_master = 0;
         clock_delay(x->x_clock, 0);
     }
-    if ((x->state == STATE_RECORDING || x->state == STATE_WAIT_ENDREC) && x->armed_finalize) {
+
+    /* x->state is only updated by _perform() at the start of a DSP block, so
+       a WAIT_PLAY/WAIT_RECORD request written by play()/wait_play()/record()
+       earlier in the SAME block hasn't landed in x->state yet. Without this,
+       a tick arriving in that same block would read the stale pre-wait state,
+       match no branch below, and be silently dropped — forcing a full extra
+       tempo cycle before the arm is actually consumed. Treat a still-pending
+       wait request as if it had already applied. */
+    t_loop_state effective_state = x->state;
+    if (x->pending_request == REQUEST_WAIT_PLAY)
+        effective_state = STATE_WAIT_PLAYING;
+    else if (x->pending_request == REQUEST_WAIT_RECORD)
+        effective_state = STATE_WAIT_RECORDING;
+
+    if ((effective_state == STATE_RECORDING || effective_state == STATE_WAIT_ENDREC) && x->armed_finalize) {
         /* end_record was requested mid-recording: only now, on the tick, do we
            actually cut the recording — so its length is an exact multiple of
            the master's loop length */
         x->pending_request = REQUEST_TICK_FINALIZE_PLAY;
         x->armed_finalize = 0;
     }
-    else if (x->state == STATE_WAIT_RECORDING)
+    else if (effective_state == STATE_WAIT_RECORDING)
         x->pending_request = REQUEST_RECORD;
-    else if (x->state == STATE_WAIT_PLAYING)
+    else if (effective_state == STATE_WAIT_PLAYING)
         /* covers both an explicit wait_play arm and a play_once pass that
            just finished (which now also lands in STATE_WAIT_PLAYING) */
         if (x->loop_length > 0)
